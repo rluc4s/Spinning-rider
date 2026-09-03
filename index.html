@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Rider ambigu — nuage de points, longue focale</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif}
+  canvas{display:block}
+  #ui{position:fixed;left:14px;bottom:14px;display:grid;gap:8px;color:#aaa;font-size:13px;
+      background:rgba(0,0,0,.55);border:1px solid #222;border-radius:10px;padding:10px 12px;max-width:calc(100vw - 52px)}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  label{display:flex;gap:6px;align-items:center}
+  input[type=range]{width:150px}
+  button{background:#111;color:#ddd;border:1px solid #444;border-radius:6px;padding:5px 10px;cursor:pointer}
+  button:hover{border-color:#888}
+  button.on{border-color:#6fd;color:#6fd}
+  #info{color:#6fd;font-variant-numeric:tabular-nums}
+  .hint{opacity:.5}
+</style>
+</head>
+<body>
+<div id="ui">
+  <div class="row">
+    <button id="reverse">⟲ Inverser le sens</button>
+    <span id="dir"></span>
+    <label>Vitesse <input id="speed" type="range" min="0" max="1.5" step="0.01" value="0.35"></label>
+  </div>
+  <div class="row">
+    <label>Focale <input id="focal" type="range" min="0" max="1" step="0.001"></label>
+    <span class="presets">
+      <button data-mm="35">35 mm</button>
+      <button data-mm="135">135 mm</button>
+      <button data-mm="2000">2000 mm</button>
+      <button data-mm="inf">∞ (ortho)</button>
+    </span>
+  </div>
+  <div class="row">
+    <label>Zoom <input id="zoom" type="range" min="0.4" max="4" step="0.01" value="1"></label>
+    <button id="reset">Recentrer la vue</button>
+  </div>
+  <div id="info"></div>
+  <div class="hint">espace = inverser · glisser = orbite · molette = zoom optique (grossit sans rapprocher la caméra)</div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ==========================================================
+   RÉGLAGES
+   ========================================================== */
+const FILM_H  = 24;      // mm — hauteur de « capteur » : tan(fov/2) = (FILM_H/2) / focale
+const FRAME_H = 6.5;     // hauteur de champ (unités monde) à zoom 1 — IDENTIQUE quelle que soit la focale
+const FRAME_W = 6.0;     // largeur minimale garantie (écrans étroits / portrait)
+const MM_MIN  = 24, MM_MAX = 8000;   // plage du curseur de focale ; butée droite = ∞ (orthographique)
+const FOCAL_0 = 2000;    // focale de départ (mm) → perspective résiduelle ≈ 1 %
+const DOT_PX  = 4.5;     // espacement moyen des points le long des arêtes (px CSS, zoom 1)
+const JITTER  = 0.012;   // dispersion latérale des points (unités monde)
+const STARS   = 420;     // points épars dans le volume
+
+/* ==========================================================
+   ÉTAPE 1 — Modèle filaire : liste d'arêtes [a,b] en 3D
+   Repère : X = longueur de la moto (avant = +X), Y = haut, Z = largeur
+   ========================================================== */
+const edges=[];
+const seg =(a,b)=>edges.push([a,b]);
+const poly=(pts,closed=false)=>{ for(let i=0;i<pts.length-1;i++) seg(pts[i],pts[i+1]); if(closed) seg(pts[pts.length-1],pts[0]); };
+function arc(c,r,plane,a0=0,a1=Math.PI*2,n=48){
+  const full=Math.abs(a1-a0)>=Math.PI*2-1e-6, pts=[];
+  for(let i=0;i<(full?n:n+1);i++){
+    const t=a0+(a1-a0)*i/n, u=Math.cos(t)*r, v=Math.sin(t)*r;
+    if(plane==='xy') pts.push([c[0]+u,c[1]+v,c[2]]);
+    if(plane==='yz') pts.push([c[0],c[1]+u,c[2]+v]);
+    if(plane==='xz') pts.push([c[0]+u,c[1],c[2]+v]);
+  }
+  poly(pts,full);
+}
+const mirrorZ=fn=>{fn(1);fn(-1);};   // dessine des deux côtés
+
+/* ---------- MOTO ---------- */
+function wheel(cx){
+  const Rw=0.62, cy=Rw;
+  mirrorZ(s=>arc([cx,cy,0.11*s],Rw,'xy'));          // flancs du pneu
+  arc([cx,cy,0],0.44,'xy');                          // jante
+  arc([cx,cy,0],0.09,'xy',0,Math.PI*2,16);           // moyeu
+  for(let i=0;i<10;i++){                             // rayons
+    const t=i/10*Math.PI*2;
+    seg([cx+Math.cos(t)*0.09,cy+Math.sin(t)*0.09,0],[cx+Math.cos(t)*0.44,cy+Math.sin(t)*0.44,0]);
+  }
+  for(let i=0;i<12;i++){                             // liaisons flanc↔flanc
+    const t=i/12*Math.PI*2, x=cx+Math.cos(t)*Rw, y=cy+Math.sin(t)*Rw;
+    seg([x,y,-0.11],[x,y,0.11]);
+  }
+}
+wheel(-1.55); wheel(1.7);
+
+// garde‑boue
+mirrorZ(s=>{ arc([-1.55,0.62,0.16*s],0.76,'xy',0.25,2.75,32); arc([1.7,0.62,0.16*s],0.74,'xy',0.6,2.4,24); });
+
+// cadre principal
+mirrorZ(s=>{
+  poly([[-1.55,0.62,0.05*s],[-1.15,1.02,0.14*s],[-0.2,1.14,0.16*s],[0.75,1.28,0.12*s],[1.15,1.38,0.08*s]]);
+  poly([[-1.55,0.62,0.05*s],[-1.2,0.45,0.18*s],[0.6,0.5,0.18*s],[1.05,0.72,0.12*s],[1.15,1.38,0.08*s]]);
+  seg([1.15,1.38,0.08*s],[1.7,0.62,0.14*s]);          // fourche
+  seg([1.22,1.55,0.08*s],[1.7,0.62,0.14*s]);
+});
+
+// réservoir
+const tank=[[-0.1,1.14],[0.15,1.3],[0.6,1.36],[0.95,1.28],[0.9,1.1],[0.1,1.02]];
+mirrorZ(s=>poly(tank.map(p=>[p[0],p[1],0.24*s]),true));
+tank.forEach(p=>seg([p[0],p[1],-0.24],[p[0],p[1],0.24]));
+
+// selle
+mirrorZ(s=>poly([[-0.15,1.16,0.2*s],[-0.7,1.2,0.22*s],[-1.2,1.1,0.18*s]]));
+seg([-0.15,1.16,-0.2],[-0.15,1.16,0.2]); seg([-1.2,1.1,-0.18],[-1.2,1.1,0.18]);
+
+// moteur : deux cylindres + carter
+mirrorZ(s=>{ arc([-0.25,0.78,0.22*s],0.2,'xy',0,Math.PI*2,28); arc([0.2,0.82,0.22*s],0.2,'xy',0,Math.PI*2,28); arc([-0.05,0.6,0.26*s],0.1,'xy',0,Math.PI*2,16); });
+poly([[-0.6,0.95,-0.24],[0.55,1.0,-0.24],[0.55,0.55,-0.24],[-0.6,0.5,-0.24]],true);
+poly([[-0.6,0.95, 0.24],[0.55,1.0, 0.24],[0.55,0.55, 0.24],[-0.6,0.5, 0.24]],true);
+
+// échappements (côté -Z)
+[0.62,0.46].forEach(y=>{
+  seg([0.1,y,-0.34],[-1.95,y+0.02,-0.36]);
+  arc([-1.95,y+0.02,-0.36],0.085,'yz',0,Math.PI*2,16);
+  arc([-1.2,y,-0.36],0.085,'yz',0,Math.PI*2,12);
+});
+
+// colonne de direction + guidon
+seg([1.15,1.38,0],[1.22,1.62,0]);
+poly([[0.95,1.5,-0.62],[1.08,1.66,-0.4],[1.2,1.62,-0.12],[1.2,1.62,0.12],[1.08,1.66,0.4],[0.95,1.5,0.62]]);
+mirrorZ(s=>{ arc([0.95,1.5,0.62*s],0.06,'yz',0,Math.PI*2,12); arc([1.02,1.58,0.5*s],0.06,'yz',0,Math.PI*2,12); });
+
+// phare (cercles + lamelles verticales)
+arc([1.38,1.35,0],0.2,'yz',0,Math.PI*2,40);
+arc([1.36,1.35,0],0.14,'yz',0,Math.PI*2,32);
+for(let i=-2;i<=2;i++){ const z=i*0.05, h=Math.sqrt(0.14*0.14-z*z); seg([1.36,1.35-h,z],[1.36,1.35+h,z]); }
+seg([1.38,1.15,0],[1.2,1.0,0]);
+
+// repose‑pieds
+mirrorZ(s=>seg([-0.45,0.42,0.2*s],[-0.45,0.42,0.45*s]));
+
+/* ---------- PILOTE ---------- */
+const HIP=[-0.65,1.2], SH=[-0.45,1.9], HEAD=[-0.4,2.3], HR=0.27;
+
+// torse / blouse
+mirrorZ(s=>{
+  poly([[SH[0],SH[1],0.3*s],[HIP[0]-0.05,HIP[1]+0.05,0.28*s],[HIP[0]-0.35,HIP[1]-0.15,0.26*s],[HIP[0]-0.55,HIP[1]-0.2,0.2*s]]);
+  poly([[SH[0]+0.1,SH[1],0.14*s],[SH[0]+0.18,SH[1]-0.35,0.0]]);    // revers
+  seg([SH[0]+0.1,SH[1]-0.35,0.12*s],[HIP[0]+0.1,HIP[1],0.12*s]);   // pan avant
+});
+seg([SH[0],SH[1],-0.3],[SH[0],SH[1],0.3]);                         // épaules
+seg([HIP[0]-0.05,HIP[1]+0.05,-0.28],[HIP[0]-0.05,HIP[1]+0.05,0.28]);
+seg([SH[0]+0.18,SH[1]-0.35,0],[HIP[0]+0.1,HIP[1],0]);              // ligne centrale
+
+// cou + tête
+seg([SH[0],SH[1],0],[HEAD[0],HEAD[1]-HR,0]);
+arc([HEAD[0],HEAD[1],0],HR,'xy',0,Math.PI*2,48);
+arc([HEAD[0],HEAD[1],0],HR,'yz',0,Math.PI*2,48);
+arc([HEAD[0],HEAD[1],0],HR*0.92,'xz',0,Math.PI*2,40);
+// visage NEUTRE : yeux ronds, nez, bouche droite
+mirrorZ(s=>{ arc([HEAD[0]+0.235,HEAD[1]+0.06,0.1*s],0.07,'yz',0,Math.PI*2,16); arc([HEAD[0]+0.245,HEAD[1]+0.06,0.1*s],0.02,'yz',0,Math.PI*2,8); });
+poly([[HEAD[0]+0.26,HEAD[1]+0.02,0],[HEAD[0]+0.31,HEAD[1]-0.08,0],[HEAD[0]+0.26,HEAD[1]-0.1,0]]);
+seg([HEAD[0]+0.25,HEAD[1]-0.17,-0.09],[HEAD[0]+0.25,HEAD[1]-0.17,0.09]);
+// cheveux en pics
+for(let i=0;i<14;i++){
+  const t=Math.PI*(0.05+0.9*i/13), zoff=[0,0.14,-0.14][i%3];
+  const bx=HEAD[0]+Math.cos(t)*HR*0.95, by=HEAD[1]+Math.sin(t)*HR*0.95;
+  const L=0.22+0.1*Math.sin(i*2.3);
+  const tip=[bx+Math.cos(t)*L, by+Math.sin(t)*L, zoff*1.6];
+  seg([bx,by,zoff],tip); seg(tip,[bx+Math.cos(t+0.25)*0.05,by+Math.sin(t+0.25)*0.05,zoff]);
+}
+// bras : épaule → coude → main sur la poignée
+mirrorZ(s=>{
+  poly([[SH[0],SH[1]-0.05,0.3*s],[0.15,1.6,0.5*s],[0.95,1.52,0.6*s]]);
+  poly([[SH[0],SH[1]-0.05,0.34*s],[0.15,1.5,0.56*s],[0.95,1.44,0.62*s]]);
+  arc([0.95,1.5,0.62*s],0.08,'xy',0,Math.PI*2,12);
+});
+// jambes pliées : hanche → genou → pied
+mirrorZ(s=>{
+  poly([[HIP[0],HIP[1],0.2*s],[-0.05,0.95,0.32*s],[-0.45,0.42,0.34*s]]);
+  poly([[HIP[0],HIP[1]-0.12,0.2*s],[-0.1,0.83,0.32*s],[-0.5,0.4,0.34*s]]);
+  poly([[-0.5,0.4,0.34*s],[-0.3,0.3,0.36*s],[-0.45,0.42,0.34*s]]);
+});
+
+/* ==========================================================
+   ÉTAPE 2 — Échantillonnage en nuage de points
+   ========================================================== */
+const frameH  = () => Math.max(FRAME_H, FRAME_W * innerHeight / innerWidth);   // hauteur de champ effective
+const DENSITY = (innerHeight / frameH()) / DOT_PX;                              // points par unité de longueur
+const positions=[], sizes=[], alphas=[];
+
+const bb=new THREE.Box3();
+edges.forEach(([a,b])=>{ bb.expandByPoint(new THREE.Vector3(...a)); bb.expandByPoint(new THREE.Vector3(...b)); });
+const center=bb.getCenter(new THREE.Vector3()), ext=bb.getSize(new THREE.Vector3());
+
+for(const [a,b] of edges){
+  const A=new THREE.Vector3(...a), B=new THREE.Vector3(...b);
+  const n=Math.max(2,Math.round(A.distanceTo(B)*DENSITY));
+  for(let i=0;i<n;i++){
+    const p=A.clone().lerp(B,(i+Math.random())/n);
+    p.x+=(Math.random()-0.5)*JITTER; p.y+=(Math.random()-0.5)*JITTER; p.z+=(Math.random()-0.5)*JITTER;
+    positions.push(p.x-center.x,p.y-center.y,p.z-center.z);
+    const r=Math.random();
+    sizes.push(r<0.15?4.5:r<0.5?3:1.8);              // mélange gros / moyens / petits points
+    alphas.push(0.8+Math.random()*0.2);
+  }
+}
+for(let i=0;i<STARS;i++){                            // « étoiles » éparses dans le volume
+  positions.push((Math.random()-0.5)*ext.x*1.05,(Math.random()-0.5)*ext.y*1.05,(Math.random()-0.5)*ext.z*2.2);
+  sizes.push(Math.random()<0.25?3:1.6);
+  alphas.push(0.35+Math.random()*0.5);
+}
+// couleurs : arc‑en‑ciel sur Y (rouge en bas → violet en haut)
+const colors=[], col=new THREE.Color(), yMin=-ext.y/2, yMax=ext.y/2;
+for(let i=0;i<positions.length;i+=3){
+  const u=THREE.MathUtils.clamp((positions[i+1]-yMin)/(yMax-yMin),0,1);
+  col.setHSL(0.78*u,0.95,0.6);
+  colors.push(col.r,col.g,col.b);
+}
+
+const geo=new THREE.BufferGeometry();
+geo.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
+geo.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));
+geo.setAttribute('aSize',new THREE.Float32BufferAttribute(sizes,1));
+geo.setAttribute('aAlpha',new THREE.Float32BufferAttribute(alphas,1));
+geo.computeBoundingSphere();
+const R=geo.boundingSphere.radius;                   // rayon englobant de l'objet
+
+const mat=new THREE.ShaderMaterial({
+  uniforms:{ uPixelRatio:{value:Math.min(devicePixelRatio,2)}, uScale:{value:1} },
+  vertexShader:`
+    attribute float aSize; attribute float aAlpha;
+    uniform float uPixelRatio, uScale;
+    varying vec3 vColor; varying float vAlpha;
+    void main(){
+      vColor=color; vAlpha=aAlpha;
+      gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);
+      // taille FIXE en pixels : aucune atténuation avec la distance → zéro indice de profondeur
+      gl_PointSize=aSize*uPixelRatio*uScale;
+    }`,
+  fragmentShader:`
+    varying vec3 vColor; varying float vAlpha;
+    void main(){
+      float d=length(gl_PointCoord-0.5);
+      if(d>0.5) discard;
+      gl_FragColor=vec4(vColor,smoothstep(0.5,0.25,d)*vAlpha);
+    }`,
+  vertexColors:true, transparent:true,
+  depthTest:false, depthWrite:false,
+  blending:THREE.AdditiveBlending     // commutatif : l'ordre devant/derrière n'a AUCUNE influence sur l'image
+});
+const cloud=new THREE.Points(geo,mat);
+const group=new THREE.Group(); group.add(cloud);
+const scene=new THREE.Scene(); scene.add(group);
+
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth,innerHeight);
+renderer.setClearColor(0x000000,1);
+document.body.appendChild(renderer.domElement);
+
+/* ==========================================================
+   ÉTAPE 3 — Optique « longue focale » : recul + focale couplés (dolly‑zoom)
+   L'écart de taille apparente entre l'avant et l'arrière de l'objet ne dépend PAS de la focale
+   mais de la distance caméra/objet d :   ratio = (d + R) / (d − R).
+   On recule donc la caméra proportionnellement à la focale, ce qui garde un cadrage constant :
+   plus la focale est longue, plus d est grand, plus le ratio tend vers 1 (limite = orthographique).
+   ========================================================== */
+const $=id=>document.getElementById(id);
+const speedEl=$('speed'), focalEl=$('focal'), zoomEl=$('zoom'), dirEl=$('dir'), info=$('info');
+const presets=[...document.querySelectorAll('.presets button')];
+const mmOf=b=>b.dataset.mm==='inf'?Infinity:+b.dataset.mm;
+
+const target=new THREE.Vector3();
+let focalMM=FOCAL_0;                                 // Infinity ⇒ caméra orthographique
+let camera=null, controls=null;
+const viewDir=new THREE.Vector3(0,0,1);              // direction cible → caméra (horizontale au départ)
+
+const fovDeg =mm=>THREE.MathUtils.radToDeg(2*Math.atan((FILM_H/2)/mm));
+const camDist=mm=>isFinite(mm) ? (frameH()/2)/((FILM_H/2)/mm) : 20*R;   // recul qui conserve frameH à l'écran
+
+function buildCamera(){
+  if(controls) controls.dispose();
+  const asp=innerWidth/innerHeight, h=frameH(), zoom=camera?camera.zoom:1;
+  camera=isFinite(focalMM)
+    ? new THREE.PerspectiveCamera(fovDeg(focalMM),asp,0.1,1e5)
+    : new THREE.OrthographicCamera(-h/2*asp,h/2*asp,h/2,-h/2,0.1,1e5);
+  camera.zoom=zoom;
+  controls=new OrbitControls(camera,renderer.domElement);
+  controls.enableZoom=false;        // la molette ne rapproche JAMAIS la caméra (ça recréerait la perspective)
+  controls.enablePan=false;
+  controls.enableDamping=true;
+  controls.target.copy(target);
+  applyOptics();
+}
+
+function applyOptics(){
+  const asp=innerWidth/innerHeight, h=frameH(), d=camDist(focalMM);
+  if(camera.isPerspectiveCamera){ camera.fov=fovDeg(focalMM); camera.aspect=asp; }
+  else { camera.left=-h/2*asp; camera.right=h/2*asp; camera.top=h/2; camera.bottom=-h/2; }
+  camera.near=Math.max(0.1,d-4*R); camera.far=d+4*R;
+  camera.updateProjectionMatrix();
+  camera.position.copy(target).addScaledVector(viewDir,d);   // même direction d'orbite, nouvelle distance
+  controls.minDistance=controls.maxDistance=d;               // distance verrouillée
+  controls.update();
+  const pct=isFinite(focalMM)?((d+R)/(d-R)-1)*100:0;
+  info.textContent=isFinite(focalMM)
+    ? `focale ${Math.round(focalMM)} mm · champ ${fovDeg(focalMM).toFixed(2)}° · caméra à ${d.toFixed(0)} unités · taille avant/arrière : +${pct.toFixed(pct<1?2:1)} %`
+    : `orthographique (focale ∞) · taille avant/arrière : +0 %`;
+}
+
+// curseur de focale : échelle logarithmique, dernier centième = ∞ (orthographique)
+const ORTHO_ZONE=0.99;
+const sliderToMm=v=>v>=ORTHO_ZONE?Infinity:Math.exp(THREE.MathUtils.lerp(Math.log(MM_MIN),Math.log(MM_MAX),v/ORTHO_ZONE));
+const mmToSlider=mm=>isFinite(mm)?ORTHO_ZONE*(Math.log(mm)-Math.log(MM_MIN))/(Math.log(MM_MAX)-Math.log(MM_MIN)):1;
+
+function setFocal(mm){
+  const needNewCamera=!camera || (camera.isOrthographicCamera!==!isFinite(mm));
+  focalMM=mm;
+  needNewCamera?buildCamera():applyOptics();
+  focalEl.value=mmToSlider(mm);
+  presets.forEach(b=>b.classList.toggle('on',mmOf(b)===mm));
+}
+focalEl.oninput=e=>setFocal(sliderToMm(+e.target.value));
+presets.forEach(b=>b.onclick=()=>setFocal(mmOf(b)));
+
+// zoom optique : grossissement pur (projection), la caméra ne bouge pas → perspective inchangée
+function setZoom(z){
+  z=THREE.MathUtils.clamp(z,+zoomEl.min,+zoomEl.max);
+  camera.zoom=z; camera.updateProjectionMatrix();
+  mat.uniforms.uScale.value=Math.pow(z,0.6);   // les points grossissent légèrement avec le zoom (tous à l'identique)
+  zoomEl.value=z;
+}
+zoomEl.oninput=e=>setZoom(+e.target.value);
+renderer.domElement.addEventListener('wheel',e=>{ e.preventDefault(); setZoom(camera.zoom*Math.exp(-e.deltaY*0.0012)); },{passive:false});
+
+$('reset').onclick=()=>{ viewDir.set(0,0,1); setZoom(1); applyOptics(); };
+
+// sens et vitesse de rotation
+let direction=1, speed=+speedEl.value;
+const setDir=d=>{ direction=d; dirEl.textContent='rotation réelle : '+(d>0?'anti‑horaire':'horaire')+' (vue de dessus)'; };
+$('reverse').onclick=()=>setDir(-direction);
+addEventListener('keydown',e=>{ if(e.code==='Space'){ e.preventDefault(); setDir(-direction); } });
+speedEl.oninput=e=>speed=+e.target.value;
+
+addEventListener('resize',()=>{ renderer.setSize(innerWidth,innerHeight); applyOptics(); });
+
+// init
+setDir(1); setFocal(FOCAL_0); setZoom(1);
+
+const clock=new THREE.Clock();
+renderer.setAnimationLoop(()=>{
+  const dt=clock.getDelta();
+  group.rotation.y+=direction*speed*dt;          // rotation réelle autour de l'axe vertical
+  controls.update();
+  viewDir.copy(camera.position).sub(target).normalize();   // mémorise la direction d'orbite courante
+  renderer.render(scene,camera);
+});
+</script>
+</body>
+</html>
